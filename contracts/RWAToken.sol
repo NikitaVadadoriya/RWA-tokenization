@@ -1,114 +1,200 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+/**
+ * @title RWAToken
+ * @dev ERC-20 Security Token for Real World Asset tokenization
+ * Features: KYC whitelist, purchase with ETH, transfer restrictions, income distribution
+ * 
+ * Flow:
+ *   1. Admin deploys contract with name, symbol, totalSupply, tokenPriceWei
+ *   2. All tokens are held BY THE CONTRACT (not the owner)
+ *   3. KYC-verified investors call buyTokens() sending ETH → receive tokens
+ *   4. ETH collected in contract → owner can withdrawFunds()
+ *   5. Owner can also mint() additional tokens if needed
+ */
+contract RWAToken {
+    string public name;
+    string public symbol;
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+    address public owner;
 
-/// @title RWAToken — ERC-20 token representing fractional ownership of a real-world asset
-/// @notice Designed to be used as a Minimal Proxy Clone (ERC-1167).
-///         Use initialize() instead of constructor when deployed via RWATokenFactory.
-contract RWAToken is ERC20, AccessControl, Pausable, Initializable {
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
-    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
-    bytes32 public constant COMPLIANCE_ROLE = keccak256("COMPLIANCE_ROLE");
+    // Price per 1 whole token (in wei). E.g., 0.001 ETH = 1000000000000000 wei
+    uint256 public tokenPriceWei;
 
-    string public assetId;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => bool) public kycApproved;
 
-    // KYC whitelist — only verified investors can hold tokens
-    mapping(address => bool) public kycWhitelist;
+    bool public tradingEnabled = false;
+    bool public transferRestricted = true;
 
-    // ─── Events ───────────────────────────────────────────────────────────────
-    event WhitelistUpdated(address indexed investor, bool status);
-    event TokensMinted(address indexed to, uint256 amount);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event KYCStatusUpdated(address indexed account, bool status);
+    event TradingStatusChanged(bool enabled);
+    event Mint(address indexed to, uint256 amount);
+    event TokensPurchased(address indexed buyer, uint256 tokenAmount, uint256 ethPaid);
+    event FundsWithdrawn(address indexed to, uint256 amount);
+    event TokenPriceUpdated(uint256 oldPrice, uint256 newPrice);
 
-    // ─── Constructor ──────────────────────────────────────────────────────────
-    /// @dev Used when deployed as an impl contract by the Factory.
-    ///      Pass empty strings / zero values — Factory immediately calls initialize().
-    constructor(
-        string memory _name,
-        string memory _symbol,
-        string memory _assetId,
-        uint256 _totalSupply,
-        address _admin
-    ) ERC20(_name, _symbol) {
-        if (_totalSupply > 0) {
-            assetId = _assetId;
-            _mint(_admin, _totalSupply * (10 ** decimals()));
+    modifier onlyOwner() {
+        require(msg.sender == owner, "RWAToken: caller is not the owner");
+        _;
+    }
+
+    modifier kycRequired(address account) {
+        require(kycApproved[account], "RWAToken: KYC verification required");
+        _;
+    }
+
+    /**
+     * @param _name Token name (e.g., "Marina Bay Tower Token")
+     * @param _symbol Token symbol (e.g., "MBT")
+     * @param _totalSupply Total number of WHOLE tokens (will be multiplied by 10^18)
+     * @param _tokenPriceWei Price of 1 whole token in wei (e.g., 1000000000000000 = 0.001 ETH)
+     */
+    constructor(string memory _name, string memory _symbol, uint256 _totalSupply, uint256 _tokenPriceWei) {
+        name = _name;
+        symbol = _symbol;
+        owner = msg.sender;
+        tokenPriceWei = _tokenPriceWei;
+        totalSupply = _totalSupply * 10**decimals;
+
+        // *** KEY CHANGE: Tokens go to CONTRACT, not owner ***
+        // Investors buy tokens from the contract's pool
+        balanceOf[address(this)] = totalSupply;
+        kycApproved[msg.sender] = true;
+        emit Transfer(address(0), address(this), totalSupply);
+    }
+
+    // ===================== PURCHASE FLOW =====================
+
+    /**
+     * @dev Investor buys tokens by sending ETH. Tokens transfer from contract → investor.
+     * @param quantity Number of WHOLE tokens to buy (will be converted to 18 decimals)
+     */
+    function buyTokens(uint256 quantity) external payable kycRequired(msg.sender) {
+        uint256 tokenAmount = quantity * 10**decimals;
+        uint256 requiredEth = quantity * tokenPriceWei;
+
+        require(msg.value >= requiredEth, "RWAToken: insufficient ETH sent");
+        require(balanceOf[address(this)] >= tokenAmount, "RWAToken: not enough tokens available");
+
+        // Transfer tokens from contract pool → investor
+        balanceOf[address(this)] -= tokenAmount;
+        balanceOf[msg.sender] += tokenAmount;
+        emit Transfer(address(this), msg.sender, tokenAmount);
+        emit TokensPurchased(msg.sender, quantity, msg.value);
+
+        // Refund excess ETH if any
+        if (msg.value > requiredEth) {
+            payable(msg.sender).transfer(msg.value - requiredEth);
         }
     }
 
-    // ─── Clone Initializer ───────────────────────────────────────────────────
-    /// @notice Called by the Factory right after cloning the implementation.
-    ///         Works like a constructor for the proxy clone.
-    function initialize(
-        string memory _name,
-        string memory _symbol,
-        string memory _assetId,
-        uint256 _totalSupply,
-        address _admin
-    ) external initializer {
-        assetId = _assetId;
-        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
-        _grantRole(MINTER_ROLE, _admin);
-        _grantRole(PAUSER_ROLE, _admin);
-        _grantRole(COMPLIANCE_ROLE, _admin);
-        _mint(_admin, _totalSupply * (10 ** decimals()));
+    /**
+     * @dev Returns how many whole tokens are still available for purchase from the contract
+     */
+    function availableTokens() external view returns (uint256) {
+        return balanceOf[address(this)] / 10**decimals;
     }
 
-    // ─── Emergency Stop ──────────────────────────────────────────────────────
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _pause();
+    /**
+     * @dev Owner withdraws collected ETH to their wallet
+     */
+    function withdrawFunds() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "RWAToken: no funds to withdraw");
+        payable(owner).transfer(balance);
+        emit FundsWithdrawn(owner, balance);
     }
 
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
+    /**
+     * @dev Owner updates token price
+     */
+    function setTokenPrice(uint256 _newPriceWei) external onlyOwner {
+        emit TokenPriceUpdated(tokenPriceWei, _newPriceWei);
+        tokenPriceWei = _newPriceWei;
     }
 
-    // ─── Compliance Functions ────────────────────────────────────────────────
-    /// @notice Admin sets KYC whitelist for an investor's wallet
-    function setWhitelist(address investor, bool status) external onlyRole(COMPLIANCE_ROLE) {
-        kycWhitelist[investor] = status;
-        emit WhitelistUpdated(investor, status);
+    // ===================== KYC MANAGEMENT =====================
+
+    function setKYCStatus(address account, bool status) external onlyOwner {
+        kycApproved[account] = status;
+        emit KYCStatusUpdated(account, status);
     }
 
-    /// @notice Batch whitelist — saves gas when onboarding multiple investors
-    function setWhitelistBatch(address[] calldata investors, bool status) external onlyRole(COMPLIANCE_ROLE) {
-        for (uint256 i = 0; i < investors.length; i++) {
-            kycWhitelist[investors[i]] = status;
-            emit WhitelistUpdated(investors[i], status);
+    function batchSetKYCStatus(address[] calldata accounts, bool status) external onlyOwner {
+        for (uint256 i = 0; i < accounts.length; i++) {
+            kycApproved[accounts[i]] = status;
+            emit KYCStatusUpdated(accounts[i], status);
         }
     }
 
-    /// @notice Mint additional tokens to a KYC-verified investor
-    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {
-        require(kycWhitelist[to], "RWAToken: investor not KYC verified");
-        _mint(to, amount);
-        emit TokensMinted(to, amount);
+    // ===================== TRADING CONTROLS =====================
+
+    function setTradingEnabled(bool _enabled) external onlyOwner {
+        tradingEnabled = _enabled;
+        emit TradingStatusChanged(_enabled);
     }
 
-    // ─── Compliance Hook ─────────────────────────────────────────────────────
-    /// @notice Override ERC-20 _update — enforces KYC on secondary transfers only
-    /// @dev Mint (from==0): KYC enforced in mint() function — skip here to allow initialize()
-    ///      Transfer (from!=0, to!=0): both wallets must be KYC verified
-    ///      Burn (to==0): always allowed
-    function _update(
-        address from,
-        address to,
-        uint256 value
-    ) internal override whenNotPaused {
-        bool isMint = (from == address(0));
-        bool isBurn = (to == address(0));
+    function setTransferRestricted(bool _restricted) external onlyOwner {
+        transferRestricted = _restricted;
+    }
 
-        if (!isMint && !isBurn) {
-            // Secondary market transfer — enforce KYC on both sides
-            require(kycWhitelist[from], "RWAToken: sender not KYC verified");
-            require(kycWhitelist[to], "RWAToken: recipient not KYC verified");
+    // ===================== ADMIN MINT (for additional supply) =====================
+
+    function mint(address to, uint256 amount) external onlyOwner kycRequired(to) {
+        totalSupply += amount;
+        balanceOf[to] += amount;
+        emit Mint(to, amount);
+        emit Transfer(address(0), to, amount);
+    }
+
+    // ===================== ERC-20 STANDARD =====================
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "RWAToken: insufficient balance");
+        if (transferRestricted) {
+            require(kycApproved[msg.sender], "RWAToken: sender not KYC approved");
+            require(kycApproved[to], "RWAToken: recipient not KYC approved");
         }
-        // Minting: KYC already checked in mint(). Initial supply mint in initialize() is admin→admin.
-        // Burning: always allowed (admin can burn if needed).
+        if (msg.sender != owner) {
+            require(tradingEnabled, "RWAToken: trading not yet enabled");
+        }
 
-        super._update(from, to, value);
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(msg.sender, to, amount);
+        return true;
     }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "RWAToken: insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "RWAToken: allowance exceeded");
+        if (transferRestricted) {
+            require(kycApproved[from], "RWAToken: sender not KYC approved");
+            require(kycApproved[to], "RWAToken: recipient not KYC approved");
+        }
+        if (from != owner) {
+            require(tradingEnabled, "RWAToken: trading not yet enabled");
+        }
+
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(from, to, amount);
+        return true;
+    }
+
+    // Allow contract to receive ETH
+    receive() external payable {}
 }

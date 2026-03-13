@@ -1,124 +1,169 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
+interface IRWAToken {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function kycApproved(address account) external view returns (bool);
+}
 
-/// @title OrderBook — On-chain secondary marketplace for RWA token trading
-contract OrderBook is AccessControl, Pausable {
-    bytes32 public constant FEE_MANAGER_ROLE = keccak256("FEE_MANAGER_ROLE");
-    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+/**
+ * @title OrderBook
+ * @dev Secondary marketplace for buying and selling RWA tokens
+ * Features: order matching, 0.5% trading fee, KYC enforcement
+ */
+contract OrderBook {
+    address public owner;
+    address public tokenContract;
+    uint256 public tradingFeePercent = 50; // 0.5% = 50 basis points
+    uint256 public collectedFees;
+
     struct Order {
         uint256 id;
-        address seller;
-        address tokenContract;
+        address trader;
+        bool isBuyOrder;
         uint256 quantity;
-        uint256 pricePerToken; // in wei
+        uint256 pricePerToken;
+        uint256 filled;
         bool active;
+        uint256 timestamp;
     }
 
+    Order[] public orders;
     uint256 public nextOrderId;
-    uint256 public tradingFeePercent = 50; // 0.5% (50 basis points)
-    address public feeCollector;
 
-    mapping(uint256 => Order) public orders;
-
-    event OrderPlaced(uint256 indexed orderId, address seller, address token, uint256 qty, uint256 price);
-    event OrderFilled(uint256 indexed orderId, address buyer, uint256 qty, uint256 totalPaid);
+    event OrderPlaced(uint256 indexed orderId, address indexed trader, bool isBuyOrder, uint256 quantity, uint256 pricePerToken);
+    event OrderFilled(uint256 indexed orderId, address indexed buyer, address indexed seller, uint256 quantity, uint256 totalPrice);
     event OrderCancelled(uint256 indexed orderId);
+    event FeesCollected(uint256 amount);
 
-    constructor(address _admin, address _feeCollector) {
-        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
-        _grantRole(FEE_MANAGER_ROLE, _admin);
-        _grantRole(PAUSER_ROLE, _admin);
-        
-        feeCollector = _feeCollector;
+    modifier onlyOwner() {
+        require(msg.sender == owner, "OrderBook: not owner");
+        _;
     }
 
-    // ─── Emergency Stop ──────────────────────────────────────────────────────
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _pause();
+    constructor(address _tokenContract) {
+        owner = msg.sender;
+        tokenContract = _tokenContract;
     }
 
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
+    // Convert whole-token quantity to token-wei (18 decimals) for ERC-20 calls
+    function toTokenWei(uint256 quantity) internal pure returns (uint256) {
+        return quantity * 1e18;
     }
 
-    /// @notice Seller lists tokens for sale (must approve this contract first)
-    function placeOrder(
-        address _tokenContract,
-        uint256 _quantity,
-        uint256 _pricePerToken
-    ) external whenNotPaused returns (uint256 orderId) {
-        require(_quantity > 0, "OrderBook: zero quantity");
+    function placeSellOrder(uint256 quantity, uint256 pricePerToken) external {
+        require(IRWAToken(tokenContract).kycApproved(msg.sender), "OrderBook: KYC required");
+        require(IRWAToken(tokenContract).balanceOf(msg.sender) >= toTokenWei(quantity), "OrderBook: insufficient tokens");
 
-        orderId = nextOrderId++;
-        orders[orderId] = Order({
+        uint256 orderId = nextOrderId++;
+        orders.push(Order({
             id: orderId,
-            seller: msg.sender,
-            tokenContract: _tokenContract,
-            quantity: _quantity,
-            pricePerToken: _pricePerToken,
-            active: true
-        });
+            trader: msg.sender,
+            isBuyOrder: false,
+            quantity: quantity,
+            pricePerToken: pricePerToken,
+            filled: 0,
+            active: true,
+            timestamp: block.timestamp
+        }));
 
-        emit OrderPlaced(orderId, msg.sender, _tokenContract, _quantity, _pricePerToken);
+        emit OrderPlaced(orderId, msg.sender, false, quantity, pricePerToken);
     }
 
-    /// @notice Buyer fills an existing order (sends ETH)
-    function fillOrder(uint256 _orderId) external payable whenNotPaused {
-        Order storage order = orders[_orderId];
-        require(order.active, "OrderBook: order not active");
-
-        uint256 totalCost = order.quantity * order.pricePerToken;
-        require(msg.value >= totalCost, "OrderBook: insufficient payment");
-
+    function placeBuyOrder(uint256 quantity, uint256 pricePerToken) external payable {
+        require(IRWAToken(tokenContract).kycApproved(msg.sender), "OrderBook: KYC required");
+        uint256 totalCost = quantity * pricePerToken;
         uint256 fee = (totalCost * tradingFeePercent) / 10000;
-        uint256 sellerAmount = totalCost - fee;
+        require(msg.value >= totalCost + fee, "OrderBook: insufficient ETH");
 
-        order.active = false;
+        uint256 orderId = nextOrderId++;
+        orders.push(Order({
+            id: orderId,
+            trader: msg.sender,
+            isBuyOrder: true,
+            quantity: quantity,
+            pricePerToken: pricePerToken,
+            filled: 0,
+            active: true,
+            timestamp: block.timestamp
+        }));
 
-        // Transfer tokens from seller to buyer
-        (bool transferOk, ) = order.tokenContract.call(
-            abi.encodeWithSignature("transferFrom(address,address,uint256)", order.seller, msg.sender, order.quantity)
-        );
-        require(transferOk, "OrderBook: token transfer failed");
+        collectedFees += fee;
+        emit OrderPlaced(orderId, msg.sender, true, quantity, pricePerToken);
+    }
 
-        // Pay seller
-        (bool sellerPaid, ) = payable(order.seller).call{value: sellerAmount}("");
-        require(sellerPaid, "OrderBook: seller payment failed");
+    function fillOrder(uint256 orderId, uint256 quantity) external payable {
+        require(orderId < orders.length, "OrderBook: invalid order");
+        Order storage order = orders[orderId];
+        require(order.active, "OrderBook: order not active");
+        require(quantity <= order.quantity - order.filled, "OrderBook: exceeds available");
 
-        // Collect fee
-        (bool feePaid, ) = payable(feeCollector).call{value: fee}("");
-        require(feePaid, "OrderBook: fee payment failed");
+        if (order.isBuyOrder) {
+            // Seller fills a buy order
+            require(IRWAToken(tokenContract).kycApproved(msg.sender), "OrderBook: KYC required");
+            uint256 totalPrice = quantity * order.pricePerToken;
 
-        // Refund excess
-        if (msg.value > totalCost) {
-            (bool refunded, ) = payable(msg.sender).call{value: msg.value - totalCost}("");
-            require(refunded, "OrderBook: refund failed");
+            // Transfer token-wei amount (quantity * 10^18)
+            IRWAToken(tokenContract).transferFrom(msg.sender, order.trader, toTokenWei(quantity));
+            (bool sent, ) = payable(msg.sender).call{value: totalPrice}("");
+            require(sent, "OrderBook: ETH transfer failed");
+
+            emit OrderFilled(orderId, order.trader, msg.sender, quantity, totalPrice);
+        } else {
+            // Buyer fills a sell order
+            require(IRWAToken(tokenContract).kycApproved(msg.sender), "OrderBook: KYC required");
+            uint256 totalPrice = quantity * order.pricePerToken;
+            uint256 fee = (totalPrice * tradingFeePercent) / 10000;
+            require(msg.value >= totalPrice + fee, "OrderBook: insufficient ETH");
+
+            // Transfer token-wei amount (quantity * 10^18)
+            IRWAToken(tokenContract).transferFrom(order.trader, msg.sender, toTokenWei(quantity));
+            (bool sent, ) = payable(order.trader).call{value: totalPrice}("");
+            require(sent, "OrderBook: ETH transfer failed");
+
+            collectedFees += fee;
+            emit OrderFilled(orderId, msg.sender, order.trader, quantity, totalPrice);
         }
 
-        emit OrderFilled(_orderId, msg.sender, order.quantity, totalCost);
+        order.filled += quantity;
+        if (order.filled >= order.quantity) {
+            order.active = false;
+        }
     }
 
-    /// @notice Seller cancels their own order
-    function cancelOrder(uint256 _orderId) external whenNotPaused {
-        Order storage order = orders[_orderId];
-        require(order.seller == msg.sender, "OrderBook: not your order");
-        require(order.active, "OrderBook: order not active");
+    function cancelOrder(uint256 orderId) external {
+        require(orderId < orders.length, "OrderBook: invalid order");
+        Order storage order = orders[orderId];
+        require(order.trader == msg.sender, "OrderBook: not your order");
+        require(order.active, "OrderBook: already inactive");
+
         order.active = false;
-        emit OrderCancelled(_orderId);
+
+        if (order.isBuyOrder) {
+            uint256 remainingQuantity = order.quantity - order.filled;
+            uint256 refund = remainingQuantity * order.pricePerToken;
+            (bool sent, ) = payable(msg.sender).call{value: refund}("");
+            require(sent, "OrderBook: refund failed");
+        }
+
+        emit OrderCancelled(orderId);
     }
 
-    /// @notice Admin updates trading fee (max 3%)
-    function setTradingFee(uint256 _basisPoints) external onlyRole(FEE_MANAGER_ROLE) {
-        require(_basisPoints <= 300, "OrderBook: fee too high");
+    function withdrawFees() external onlyOwner {
+        uint256 fees = collectedFees;
+        collectedFees = 0;
+        (bool sent, ) = payable(owner).call{value: fees}("");
+        require(sent, "OrderBook: withdrawal failed");
+        emit FeesCollected(fees);
+    }
+
+    function getOrderCount() external view returns (uint256) {
+        return orders.length;
+    }
+
+    function setTradingFee(uint256 _basisPoints) external onlyOwner {
+        require(_basisPoints <= 1000, "OrderBook: fee too high");
         tradingFeePercent = _basisPoints;
-    }
-
-    /// @notice Admin updates fee collector address
-    function setFeeCollector(address _newCollector) external onlyRole(FEE_MANAGER_ROLE) {
-        require(_newCollector != address(0), "OrderBook: zero address");
-        feeCollector = _newCollector;
     }
 }

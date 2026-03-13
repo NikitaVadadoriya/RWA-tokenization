@@ -1,95 +1,88 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+interface IRWA {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+}
 
-/// @title IncomeDistributor — Proportionally distributes ETH income to all token holders
-/// @notice Supports both direct deployment and ERC-1167 Minimal Proxy Clones.
-contract IncomeDistributor is AccessControl, Pausable, Initializable {
-    bytes32 public constant DISTRIBUTOR_ROLE = keccak256("DISTRIBUTOR_ROLE");
-    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+/**
+ * @title IncomeDistributor
+ * @dev Distributes income (ETH/MATIC) proportionally to all RWA token holders
+ * Used for rental yields, bond coupons, project revenue, etc.
+ */
+contract IncomeDistributor {
+    address public owner;
+    address public tokenContract;
 
-    IERC20 public rwaToken;
-    string public assetId;
-
-    event IncomeDeposited(uint256 amount, uint256 timestamp);
-    event IncomeDistributed(address indexed investor, uint256 amount);
-    event DistributionCompleted(uint256 totalDistributed, uint256 recipientCount);
-
-    // ─── Constructor (for direct deployment) ────────────────────────────────
-    constructor(address _rwaToken, string memory _assetId, address _admin) {
-        if (_rwaToken != address(1)) { // address(1) = placeholder for Factory impl deploy
-            rwaToken = IERC20(_rwaToken);
-            assetId = _assetId;
-        }
+    struct Distribution {
+        uint256 totalAmount;
+        uint256 timestamp;
+        uint256 totalSupplyAtTime;
+        string description;
     }
 
-    // ─── Clone Initializer ───────────────────────────────────────────────────
-    /// @notice Called by IncomeDistributorFactory right after cloning
-    function initialize(
-        address _rwaToken,
-        string memory _assetId,
-        address _admin
-    ) external initializer {
-        rwaToken = IERC20(_rwaToken);
-        assetId = _assetId;
-        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
-        _grantRole(DISTRIBUTOR_ROLE, _admin);
-        _grantRole(PAUSER_ROLE, _admin);
+    Distribution[] public distributions;
+    mapping(uint256 => mapping(address => bool)) public claimed;
+
+    event IncomeDeposited(uint256 indexed distributionId, uint256 amount, string description);
+    event IncomeClaimed(uint256 indexed distributionId, address indexed investor, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "IncomeDistributor: not owner");
+        _;
     }
 
-    // ─── Emergency Stop ──────────────────────────────────────────────────────
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _pause();
+    constructor(address _tokenContract) {
+        owner = msg.sender;
+        tokenContract = _tokenContract;
     }
 
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
+    function depositIncome(string calldata description) external payable onlyOwner {
+        require(msg.value > 0, "IncomeDistributor: zero amount");
+
+        uint256 distId = distributions.length;
+        distributions.push(Distribution({
+            totalAmount: msg.value,
+            timestamp: block.timestamp,
+            totalSupplyAtTime: IRWA(tokenContract).totalSupply(),
+            description: description
+        }));
+
+        emit IncomeDeposited(distId, msg.value, description);
     }
 
-    // ─── Income Deposit ──────────────────────────────────────────────────────
-    /// @notice Admin deposits ETH income into the distributor (e.g. rental income)
-    receive() external payable {
-        emit IncomeDeposited(msg.value, block.timestamp);
+    function claimIncome(uint256 distributionId) external {
+        require(distributionId < distributions.length, "IncomeDistributor: invalid ID");
+        require(!claimed[distributionId][msg.sender], "IncomeDistributor: already claimed");
+
+        Distribution memory dist = distributions[distributionId];
+        uint256 holderBalance = IRWA(tokenContract).balanceOf(msg.sender);
+        require(holderBalance > 0, "IncomeDistributor: no tokens held");
+
+        uint256 share = (dist.totalAmount * holderBalance) / dist.totalSupplyAtTime;
+        require(share > 0, "IncomeDistributor: zero share");
+
+        claimed[distributionId][msg.sender] = true;
+
+        (bool sent, ) = payable(msg.sender).call{value: share}("");
+        require(sent, "IncomeDistributor: transfer failed");
+
+        emit IncomeClaimed(distributionId, msg.sender, share);
     }
 
-    // ─── Distribution ────────────────────────────────────────────────────────
-    /// @notice Distribute ALL pending ETH proportionally to a batch of investors
-    /// @param investors Addresses of token holders to distribute to
-    function distribute(address[] calldata investors) external onlyRole(DISTRIBUTOR_ROLE) whenNotPaused {
-        uint256 totalSupply = rwaToken.totalSupply();
-        require(totalSupply > 0, "IncomeDistributor: no tokens in circulation");
-
-        uint256 totalBalance = address(this).balance;
-        require(totalBalance > 0, "IncomeDistributor: no income to distribute");
-
-        uint256 distributed = 0;
-        uint256 recipientCount = 0;
-
-        for (uint256 i = 0; i < investors.length; i++) {
-            address investor = investors[i];
-            uint256 holdings = rwaToken.balanceOf(investor);
-            if (holdings == 0) continue;
-
-            uint256 share = (totalBalance * holdings) / totalSupply;
-            if (share == 0) continue;
-
-            distributed += share;
-            recipientCount++;
-
-            (bool success, ) = payable(investor).call{value: share}("");
-            require(success, "IncomeDistributor: transfer to investor failed");
-            emit IncomeDistributed(investor, share);
-        }
-
-        emit DistributionCompleted(distributed, recipientCount);
+    function getDistributionCount() external view returns (uint256) {
+        return distributions.length;
     }
 
-    /// @notice View pending ETH balance waiting to be distributed
-    function pendingIncome() external view returns (uint256) {
-        return address(this).balance;
+    function getClaimableAmount(uint256 distributionId, address investor) external view returns (uint256) {
+        if (distributionId >= distributions.length) return 0;
+        if (claimed[distributionId][investor]) return 0;
+
+        Distribution memory dist = distributions[distributionId];
+        uint256 holderBalance = IRWA(tokenContract).balanceOf(investor);
+        if (holderBalance == 0) return 0;
+
+        return (dist.totalAmount * holderBalance) / dist.totalSupplyAtTime;
     }
 }
